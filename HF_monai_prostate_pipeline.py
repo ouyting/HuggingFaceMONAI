@@ -21,12 +21,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"正在使用的计算设备: {device.type.upper()}")
 
 # 2. 输入的 T2W 轴位前列腺 MRI（.nii.gz）
-mri_path = "601_MR_AXT2.nii.gz"
+mri_path = "601_MR_AXT2.nii.gz" # 8_MR_t2_tse_trasfov.nii.gz
 if not os.path.exists(mri_path):
     raise FileNotFoundError(f"未找到 MRI 数据: {mri_path}")
+# 输出文件以输入文件名为前缀，例如 601_MR_AXT2.nii.gz -> 601_MR_AXT2_cg_mask.nii.gz
+out_prefix = os.path.basename(mri_path).removesuffix(".gz").removesuffix(".nii")
+# 导出的 .nii.gz 掩膜统一放到 output 文件夹
+output_dir = "output"
+os.makedirs(output_dir, exist_ok=True)
 
 # 3. 从 Hugging Face 的 MONAI 官方仓库下载前列腺解剖分割 Bundle 模型
-# 该模型输出 背景(0) / 中央腺体CG(1) / 外周带PZ(2)，这里将 CG+PZ 合并为整个前列腺
+# 该模型输出 背景(0) / 中央腺体CG(1) / 外周带PZ(2)，这里同时输出 CG、PZ 及二者合并的整个前列腺
 model_name = "prostate_mri_anatomy"
 model_dir = "./models"
 bundle_root = os.path.join(model_dir, model_name)
@@ -83,10 +88,13 @@ with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.typ
     )
     probs = torch.softmax(logits.float(), dim=1)
 
-# 7. 整个前列腺的概率 = 1 - 背景概率，反变换回原始图像空间后再二值化，边界更平滑
-data["pred"] = 1.0 - probs[0, :1].cpu()
+# 7. 将 CG/PZ 两通道概率反变换回原始图像空间后再二值化，边界更平滑
+# （不反变换背景通道：裁剪的逆变换会在裁剪区外补 0，背景概率为 0 会被误判为前列腺）
+data["pred"] = probs[0, 1:].cpu()
 data = Invertd(keys="pred", transform=preprocessing, orig_keys="image", nearest_interp=False)(data)
-mask = (data["pred"] > 0.5).to(torch.uint8)
+probs_orig = data["pred"]  # [0]=CG, [1]=PZ
+# 整个前列腺的概率 = CG 概率 + PZ 概率（即 1 - 背景概率）
+mask = (probs_orig.sum(dim=0, keepdim=True) > 0.5).to(torch.uint8)
 mask = KeepLargestConnectedComponent()(mask)  # 去除假阳性碎块
 mask = FillHoles()(mask)                      # 填补腺体内部空洞
 mask = mask[0].numpy().astype(np.uint8)
@@ -102,20 +110,34 @@ for z in range(mask.shape[-1]):
     mask[..., z] = ndimage.binary_fill_holes(mask[..., z]).astype(np.uint8)  # 填补该层内的空洞
 mask = np.moveaxis(mask, -1, axial_axis)
 
+# 在整个前列腺掩膜内按 CG / PZ 概率大小划分分区，保证 CG ∪ PZ 与整个前列腺完全一致
+probs_np = probs_orig.numpy()
+cg = ((probs_np[0] >= probs_np[1]) & (mask > 0)).astype(np.uint8)
+if cg.any():
+    cg = KeepLargestConnectedComponent()(cg[None])[0].numpy().astype(np.uint8)  # CG 是单一实体，碎块归入 PZ
+    cg = ndimage.binary_fill_holes(cg).astype(np.uint8)  # CG 内部的孤立 PZ 体素归回 CG
+pz = ((mask > 0) & (cg == 0)).astype(np.uint8)
+zones = (cg * 1 + pz * 2).astype(np.uint8)  # 0=背景, 1=CG, 2=PZ
+
 voxel_ml = np.prod(orig_img.header.get_zooms()[:3]) / 1000.0
-print(f"分割完成！前列腺体积约 {mask.sum() * voxel_ml:.1f} mL")
+print(f"分割完成！前列腺体积约 {mask.sum() * voxel_ml:.1f} mL "
+      f"(CG {cg.sum() * voxel_ml:.1f} mL, PZ {pz.sum() * voxel_ml:.1f} mL)")
 
-# 8. 保存前列腺掩膜（与原始 MRI 相同的空间和 affine，可在 ITK-SNAP / 3D Slicer 中叠加查看）
-out_mask_path = "601_MR_AXT2_prostate_mask.nii.gz"
-nib.save(nib.Nifti1Image(mask, orig_img.affine), out_mask_path)
-print(f"前列腺掩膜已保存至: {out_mask_path}")
+# 8. 保存掩膜（与原始 MRI 相同的空间和 affine，可在 ITK-SNAP / 3D Slicer 中叠加查看）
+for name, arr in [("prostate_mask", mask), ("cg_mask", cg), ("pz_mask", pz), ("zones", zones)]:
+    out_path = os.path.join(output_dir, f"{out_prefix}_{name}.nii.gz")
+    nib.save(nib.Nifti1Image(arr, orig_img.affine), out_path)
+    print(f"掩膜已保存至: {out_path}")
 
-# 9. 可视化：在包含前列腺的轴位切片上绘制前列腺边界轮廓
+# 9. 可视化：在包含前列腺的轴位切片上绘制整个前列腺、CG、PZ 的边界轮廓
 # 统一转到 LPS 方向，使 slice.T 显示为放射学视图（前方朝上、患者右侧在图像左侧）
 to_lps = nib.orientations.ornt_transform(
     nib.orientations.io_orientation(orig_img.affine), nib.orientations.axcodes2ornt(("L", "P", "S")))
 image_lps = nib.orientations.apply_orientation(orig_img.get_fdata(), to_lps)
 mask_lps = nib.orientations.apply_orientation(mask, to_lps)
+cg_lps = nib.orientations.apply_orientation(cg, to_lps)
+pz_lps = nib.orientations.apply_orientation(pz, to_lps)
+contour_styles = [(mask_lps, "lime", "Prostate", 3.0), (cg_lps, "red", "CG", 1.2), (pz_lps, "deepskyblue", "PZ", 1.2)]
 
 slices = np.where(mask_lps.any(axis=(0, 1)))[0]
 if len(slices) == 0:
@@ -127,10 +149,13 @@ else:
         ax.axis("off")
     for ax, z in zip(axes.flat, show):
         ax.imshow(image_lps[:, :, z].T, cmap="gray")
-        for contour in measure.find_contours(mask_lps[:, :, z].T.astype(float), 0.5):
-            ax.plot(contour[:, 1], contour[:, 0], color="lime", linewidth=1.5)
+        for arr, color, _, lw in contour_styles:
+            for contour in measure.find_contours(arr[:, :, z].T.astype(float), 0.5):
+                ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=lw)
         ax.set_title(f"Slice {z}")
-    fig.suptitle("MONAI Prostate Boundary (T2W)")
-    plt.tight_layout()
-    plt.savefig("601_MR_AXT2_prostate_boundary.png", dpi=150)
+    fig.legend(handles=[plt.Line2D([], [], color=c, label=l) for _, c, l, _ in contour_styles],
+               loc="lower center", ncol=3)
+    fig.suptitle("MONAI Prostate / CG / PZ Boundary (T2W)")
+    plt.tight_layout(rect=(0, 0.04, 1, 1))
+    plt.savefig(f"{out_prefix}_prostate_boundary.png", dpi=150)
     plt.show()
