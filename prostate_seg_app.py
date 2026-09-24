@@ -21,7 +21,7 @@ import torch
 import gradio as gr
 
 from HF_monai_prostate_pipeline import (
-    load_model, segment, voxel_volume_ml, to_lps, draw_slice, legend_handles,
+    load_model, segment, voxel_volume_ml, to_lps, draw_slice, legend_handles, CONTOUR_STYLES,
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,33 +80,38 @@ def fig_to_array(fig):
     return arr
 
 
-def render_slice(state, z):
+def render_slice(state, z, visible):
     if not state:
         return None
     z = int(z)
     fig, ax = plt.subplots(figsize=(6, 6))
-    draw_slice(ax, state["image"], state["masks"], z)
+    draw_slice(ax, state["image"], state["masks"], z, visible)
     ax.set_title(f"Slice {z}")
-    ax.legend(handles=legend_handles(), loc="lower right", fontsize=8)
+    if visible:
+        ax.legend(handles=legend_handles(visible), loc="lower right", fontsize=8)
     fig.tight_layout()
     return fig_to_array(fig)
 
 
-def render_overview(state, slices):
+def render_overview(state, visible):
+    slices = state["slices"] if state else []
+    if len(slices) == 0:
+        return None
     show = np.unique(np.linspace(slices[0], slices[-1], min(6, len(slices))).round().astype(int))
     fig, axes = plt.subplots(2, 3, figsize=(13, 9))
     for ax in axes.flat:
         ax.axis("off")
     for ax, z in zip(axes.flat, show):
-        draw_slice(ax, state["image"], state["masks"], z)
+        draw_slice(ax, state["image"], state["masks"], z, visible)
         ax.set_title(f"Slice {z}")
-    fig.legend(handles=legend_handles(), loc="lower center", ncol=3)
+    if visible:
+        fig.legend(handles=legend_handles(visible), loc="lower center", ncol=3)
     fig.suptitle("MONAI Prostate / CG / PZ Boundary (T2W)")
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     return fig_to_array(fig)
 
 
-def run(uploaded, progress=gr.Progress()):
+def run(uploaded, visible, progress=gr.Progress()):
     if not uploaded:
         raise gr.Error("请先上传 DICOM 文件或 zip 压缩包")
     uploaded = [f if isinstance(f, str) else f.name for f in uploaded]
@@ -150,17 +155,18 @@ def run(uploaded, progress=gr.Progress()):
     )
 
     image_lps, mask_lps, cg_lps, pz_lps = to_lps(orig_img, orig_img.get_fdata(dtype=np.float32), mask, cg, pz)
-    state = {"image": image_lps, "masks": (mask_lps, cg_lps, pz_lps)}
     slices = np.where(mask_lps.any(axis=(0, 1)))[0]
+    state = {"image": image_lps, "masks": (mask_lps, cg_lps, pz_lps), "slices": slices}
     n_slices = image_lps.shape[2]
     if len(slices) == 0:
         summary += "\n\n⚠️ 未分割到前列腺，请检查输入图像是否为 T2W 轴位前列腺 MRI"
-        overview, z0 = None, n_slices // 2
+        z0 = n_slices // 2
     else:
-        overview, z0 = render_overview(state, slices), int(slices[len(slices) // 2])
+        z0 = int(slices[len(slices) // 2])
 
     slider = gr.Slider(minimum=0, maximum=n_slices - 1, value=z0, step=1, interactive=True)
-    return summary, overview, slider, render_slice(state, z0), out_files, state
+    return (summary, render_overview(state, visible), slider, render_slice(state, z0, visible),
+            out_files, state)
 
 
 with gr.Blocks(title="前列腺 MRI 分割") as demo:
@@ -175,6 +181,8 @@ with gr.Blocks(title="前列腺 MRI 分割") as demo:
         with gr.Column(scale=1):
             files = gr.File(label="上传 DICOM 文件 / zip / NRRD", file_count="multiple", type="filepath")
             run_btn = gr.Button("开始分割", variant="primary")
+            structure_names = [name for name, _, _ in CONTOUR_STYLES]
+            visible = gr.CheckboxGroup(structure_names, value=structure_names, label="显示的分割掩膜")
             summary = gr.Markdown()
             downloads = gr.File(label="下载分割掩膜 (NIfTI)", file_count="multiple", interactive=False)
         with gr.Column(scale=2):
@@ -184,9 +192,12 @@ with gr.Blocks(title="前列腺 MRI 分割") as demo:
             with gr.Tab("概览"):
                 overview = gr.Image(label="前列腺范围内均匀选取的 6 层切片", type="numpy", interactive=False)
 
-    run_btn.click(run, inputs=files,
+    run_btn.click(run, inputs=[files, visible],
                   outputs=[summary, overview, slice_slider, slice_view, downloads, state])
-    slice_slider.change(render_slice, inputs=[state, slice_slider], outputs=slice_view, show_progress="hidden")
+    slice_slider.change(render_slice, inputs=[state, slice_slider, visible], outputs=slice_view,
+                        show_progress="hidden")
+    visible.change(lambda s, z, v: (render_slice(s, z, v), render_overview(s, v)),
+                   inputs=[state, slice_slider, visible], outputs=[slice_view, overview], show_progress="hidden")
 
 
 if __name__ == "__main__":

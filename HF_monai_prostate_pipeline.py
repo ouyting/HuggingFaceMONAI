@@ -128,17 +128,21 @@ def to_lps(orig_img, *arrays):
     return [nib.orientations.apply_orientation(a, ornt) for a in arrays]
 
 
-def draw_slice(ax, image_lps, masks_lps, z):
-    """在一张轴位切片上绘制整个前列腺、CG、PZ 的边界轮廓。masks_lps 顺序与 CONTOUR_STYLES 一致。"""
+def draw_slice(ax, image_lps, masks_lps, z, visible=None):
+    """在一张轴位切片上绘制整个前列腺、CG、PZ 的边界轮廓。masks_lps 顺序与 CONTOUR_STYLES 一致。
+    visible 为要显示的结构名称集合，None 表示全部显示。"""
     ax.imshow(image_lps[:, :, z].T, cmap="gray")
-    for arr, (_, color, lw) in zip(masks_lps, CONTOUR_STYLES):
+    for arr, (name, color, lw) in zip(masks_lps, CONTOUR_STYLES):
+        if visible is not None and name not in visible:
+            continue
         for contour in measure.find_contours(arr[:, :, z].T.astype(float), 0.5):
             ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=lw)
     ax.axis("off")
 
 
-def legend_handles():
-    return [plt.Line2D([], [], color=c, label=l) for l, c, _ in CONTOUR_STYLES]
+def legend_handles(visible=None):
+    return [plt.Line2D([], [], color=c, label=l) for l, c, _ in CONTOUR_STYLES
+            if visible is None or l in visible]
 
 
 if __name__ == "__main__":
